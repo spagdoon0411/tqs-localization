@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from embedding import PotentialSpinEncoding
-from torch.func import vmap
+from torch.func import functional_call, vmap, grad, jacrev
 
 
 class TQS(nn.Module):
@@ -40,9 +40,13 @@ class TQS(nn.Module):
         self.prob_head = nn.Linear(embed_dim, possible_spins)
         self.phase_head = nn.Linear(embed_dim, 1)
 
+        self.L = None
+
     def forward(self, potentials: torch.Tensor, spins: torch.Tensor):
         # potentials: (seq, batch)
         # spins: (seq, batch)
+
+        self.L = potentials.size(0)
 
         seq = self.embedding(potentials, spins)  # (seq, batch, embed_dim)
         seq = self.encoder(seq)  # (seq, batch, embed_dim)
@@ -85,16 +89,129 @@ class TQS(nn.Module):
 
         return sampled_spins
 
+    def psi_from_probs_phases(self, probs, phases):
+        probs = probs[self.L :, :, 0]  # TODO: any reason to preserve embed dimension?
+        phases = phases[self.L :, :, 0]
+        psi = torch.sqrt(probs) * torch.exp(1j * phases)
+        return psi
+
     def compute_psi(self, x, V, t):
         """
         Computes a complete complex wavefunction at the basis states provided
         """
         chain_length = x.size(0)
         prob, phases = self.forward(V, x)
-        prob = prob[chain_length:, :, 1]  # (seq, batch); P(s=1 | V, x)
-        phases = phases[chain_length:].squeeze()
-        psi = torch.sqrt(prob) * torch.exp(1j * phases)
+        # prob = prob[chain_length:, :, 1]  # (seq, batch); P(s=1 | V, x)
+        # phases = phases[chain_length:].squeeze()
+        psi = self.psi_from_probs_phases(prob, phases)
         return psi
+
+    def _ln_P(self, x, V, params, buffers):
+        """
+        Computes ln(P(x; theta)) for a basis state and corresponding potential function vector.
+        Does this in a manner amenable to using vmapping a function created with grad over
+        a batch of spins.
+
+        NOTE: MUST BE GIVEN A SINGLE SAMPLE. This function should not be used on the top
+        level; it's meant to be used in d_ln_dtheta.
+
+        This function is "einmapped" over the batch dimension, so it should
+        take individual samples and not batches.
+        """
+
+        # Unsqueeze if there's no batch dimension
+        if x.dim() == 1:
+            x = x.unsqueeze(1)
+            V = V.unsqueeze(1)
+
+        probs, phases = functional_call(
+            self, (params, buffers), (V, x)
+        )  # <module>, (parameters, buffers), <inputs to module's forward>
+        psi_x = self.psi_from_probs_phases(probs, phases)
+
+        # TODO: Do the phases not matter at all? Argument: no! The phase head
+        # should be included in backpropagation. But it seems there's no dependency
+        # of the output probabilities on the parameters of the phase head; why would
+        # the phase head even get updated?
+
+        # TODO: calculate the derivative of the phases with respect to model parameters
+        # explicitly; it's suspicious that the phase head gets adjusted during training.
+
+        ln_P = torch.log((torch.conj(psi_x) * psi_x).real)
+        return ln_P
+
+    def _E_loc(self, x, V, t, params, buffers):
+        """
+        Computes the local energy for a basis state and corresponding potential function vector.
+        Does this in a manner amenable to using vmapping a function created with grad over
+        a batch of spins.
+
+        NOTE: MUST BE GIVEN A SINGLE SAMPLE. This function should not be used on the top
+        level; it's meant to be used in dEloc_dTheta.
+
+        This function is "einmapped" over the batch dimension, so it should
+        take individual samples and not batches.
+        """
+
+        # Unsqueeze if there's no batch dimension
+        if x.dim() == 1:
+            x = x.unsqueeze(1)
+            V = V.unsqueeze(1)
+
+        # Roll along seq (dim 0)
+        x_l = torch.roll(x, 1, dims=0)
+        x_r = torch.roll(x, -1, dims=0)
+        V_l = torch.roll(V, 1, dims=0)
+        V_r = torch.roll(V, -1, dims=0)
+
+        # TODO: take probs and phases from other calculations in the args
+        # for this function
+        psi_x = self.psi_from_probs_phases(
+            *functional_call(self, (params, buffers), (V, x))
+        )
+        psi_l = self.psi_from_probs_phases(
+            *functional_call(self, (params, buffers), (V_l, x_l))
+        )
+        psi_r = self.psi_from_probs_phases(
+            *functional_call(self, (params, buffers), (V_r, x_r))
+        )
+        print("Psi shapes:", psi_x.shape, psi_l.shape, psi_r.shape)
+        print("V shapes:", V.shape, V_l.shape, V_r.shape)
+
+        E_loc_1 = -t * (psi_x**-1) * (psi_l + psi_r)
+        E_loc_2 = V * psi_x
+        E_loc = E_loc_1 + E_loc_2
+        return E_loc
+
+    def dlnP_dTheta(self, x, V, params, buffers):
+        """
+        The goal of this function is to compute the gradient of ln(P(x; Theta)) with respect
+        to "big-T" Theta, the set of all model parameters. In effect it returns
+        a collection of dlnP_dtheta_i's, where i corresponds to some parameter tensor of the
+        model:
+
+        (dlnP_dtheta_1, dlnP_dtheta_2, ..., dlnP_dtheta_p)
+
+        This is returned in the form of a dictionary mapping parameter/buffer names to
+        their respective gradients. This is done batch-wise, so that we can compute the
+        expectation value.
+        """
+
+        # Compute the Jacobian with respect to x.
+        dlnP_dtheta_sample = jacrev(self._ln_P)
+
+        # in_dims=(1, 1, None, None) produces iteration over dimension 1 (the batch dim) of the
+        # spins and the potentials and does no "ein-iteration" over the parameters or buffers
+        # (treated as constant with respect to the iteration)
+        vmap_dlnP_dtheta = vmap(dlnP_dtheta_sample, in_dims=(1, 1, None, None))
+        return vmap_dlnP_dtheta(x, V, params, buffers)
+
+    def dEloc_dTheta(self, x, V, t, params, buffers):
+
+        dEloc_dtheta_sample = jacrev(self._E_loc)
+
+        vmap_dEloc_dtheta = vmap(dEloc_dtheta_sample, in_dims=(1, 1, None, None))
+        return vmap_dEloc_dtheta(x, V, t, params, buffers)
 
     def weights_from_sample(self, x):
         """
@@ -127,68 +244,37 @@ class TQS(nn.Module):
         Compute E_loc values across a batch of samples x of dimension (seq, batch)
         and potentials V of dimension (seq, batch).
         """
-        return -t * 1 / psi_x * (psi_l + psi_r) + V * psi_x
-
-    def d_ln_P_dtheta(self, psi_x: torch.Tensor):
-        """
-        Compute the derivative of the probability distribution with respect to model
-        parameters. Note that this *can* be done with autodiff; we don't perform
-        any sampling.
-        """
-        batch = psi_x.size(1)
-        seq = psi_x.size(0)
-        ones_like_params = [torch.ones_like(param) for param in self.parameters()]
-        for param in self.parameters():
-            first_param = param
-
-        # psi_x: (seq, batch)
-
-        # the problem is that we're not preserving the batch dimension; we end up summing
-        # across the batch (sample) dimension prematurely, ruining expectation value
-        # calculations down the road
-
-        # ones = torch.ones_like(psi_x, requires_grad=True)
-
-        # grad_sample = lambda psi: torch.tensor(
-        #     torch.autograd.grad(
-        #         torch.log(psi * psi.conj()),
-        #         self.parameters(),
-        #         create_graph=True,
-        #         grad_outputs=ones,
-        #         allow_unused=True,
-        #     )
-        # )
-
-        get_batched_grad = lambda input: torch.autograd.grad(
-            torch.log(psi_x * psi_x.conj()),
-            self.parameters(),
-            create_graph=True,
-            grad_outputs=input,
-            allow_unused=True,
-        )
-
-        return vmap(get_batched_grad, in_dims=1, randomness="same")(torch.eye(batch))
-
-        # print("psi_x.requires_grad:", psi_x.requires_grad)
-        # return vmap(grad_sample, in_dims=1, randomness="same")(psi_x)
-
-        # ideally we want a list of tensors (one for each updateable parameter)
-        # where each tensor is of shape (batch, param_dims...)
-        # return torch.autograd.grad(
-        #     torch.log(psi_x * psi_x.conj()),
-        #     self.parameters(),
-        #     create_graph=True,
-        #     grad_outputs=torch.ones_like(psi_x),
-        #     # TODO: why would a preliminary d(output)/d(output) be useful?
-        #     allow_unused=True,
-        # )
+        return -t * 1 / psi_x * (psi_l + psi_r) + V
 
     def gradient(self, x, V, t):
         """
         Compute the gradient of the local energy with respect to the model parameters.
         """
-        psi_x, psi_l, psi_r = self.psi_terms(x, V, t)
-        E_loc = self.E_loc(psi_x, psi_l, psi_r, V, t)  # (seq, batch)
-        d_ln_P_dtheta = self.d_ln_P_dtheta(psi_x)  # (seq, batch, num_params)
+        # psi_x, psi_l, psi_r = self.psi_terms(x, V, t)
+        # E_loc = self.E_loc(psi_x, psi_l, psi_r, V, t)  # (seq, batch)
 
-        return torch.mean(E_loc * d_ln_P_dtheta, dim=1)
+        params = {k: v.detach() for k, v in self.named_parameters()}
+        buffers = {k: v.detach() for k, v in self.named_buffers()}
+
+        # E_loc as a function of basis states (spin chains)
+        E_loc = self._E_loc(x, V, t)
+
+        # Dictionary from parameter/buffer name to gradient tensors
+        # of ln(P(x; Theta)) with respect to that parameter/buffer
+        dln_Pdtheta = self.dlnP_dTheta(x, V, params, buffers)
+
+        # Dictionary from parameter/buffer name to gradient tensors
+        # of E_loc with respect to that parameter/buffer
+        dEloc_dtheta = self.dEloc_dTheta(x, V, t, params, buffers)
+
+        expect = lambda x: torch.mean(x, dim=0)
+        cov = lambda x, y: expect(x * y) - expect(x) * expect(y)
+
+        # Perform the calculations across the dictionary
+        dE_dTheta = {
+            param_name: cov(dln_Pdtheta[param_name], E_loc)
+            + expect(dEloc_dtheta[param_name])
+            for param_name in dln_Pdtheta.keys()
+        }
+
+        return dE_dTheta
